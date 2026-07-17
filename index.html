@@ -206,11 +206,20 @@
           </div>
         </div>
         <div id="priceChart"></div>
-        <p class="hint">Click instruments in the rail to highlight (up to 8). Unselected series stay as faint context; hover for a unified readout.</p>
+        <p class="hint">Shift-click (or Ctrl / ⌘-click) a line to select or deselect it — or click instruments in the rail. Up to 8 highlighted; the rest stay as faint context. Hover for a unified readout.</p>
       </section>
 
       <section class="view" id="view-ma">
-        <div class="head"><div><h1>Moving-average analysis</h1><div class="sub">One chart per instrument; each definition applied to all. ▲ golden / ▼ death markers flag where the fastest MA crosses the slowest.</div></div></div>
+        <div class="head">
+          <div>
+            <h1>Moving-average analysis</h1>
+            <div class="sub">One chart per instrument; each definition applied to all. ▲ golden / ▼ death markers flag where the fastest MA crosses the slowest.</div>
+          </div>
+          <div class="modes">
+            <button type="button" id="maRebase">Rebase to 100</button>
+            <button type="button" id="maLog">Log y-axis</button>
+          </div>
+        </div>
         <div id="maCharts"></div>
       </section>
 
@@ -244,12 +253,16 @@
     const FONT = 'Cascadia Code, Cascadia Mono, ui-monospace, monospace';
 
     const MA_TYPES = ["SMA (Simple)", "EMA (Exponential)", "WMA (Weighted)", "DEMA (Double Exp.)"];
+    const TABS = ["prices", "ma", "corr", "stats"];
+    const STORE_KEY = "larpe-sharpe-visualiser:v1";  // localStorage slot for the session
 
     const state = {
       tab: "prices",
       highlights: ASSETS.slice(0, 5),        // Prices: highlighted names, in colour order
       rebase: false,
       logY: false,
+      maRebase: false,                       // MA: rebase price + MAs to 100
+      maLog: false,                          // MA: log y-axis
       maInstruments: ASSETS.slice(0, 2),     // MA: selected instruments
       maDefs: [{ type: "SMA (Simple)", period: 20 }, { type: "EMA (Exponential)", period: 20 }],
       corrSubset: [],                        // Correlation: empty = all
@@ -329,16 +342,20 @@
 
     // --- Prices ---------------------------------------------------------- //
     function drawPrices() {
+      persist();
       const traces = [];
       const tf = (p) => (state.rebase ? rebase100(p) : p);
       ASSETS.forEach((name) => {
         if (colorFor(name)) return;
+        // hoverinfo "none" (not "skip") keeps the faint line clickable without
+        // adding it to the unified hover box. meta lets a click map back to the
+        // instrument regardless of trace order.
         traces.push({ x: days, y: tf(DATA.prices[name]), type: "scatter", mode: "lines",
-          line: { color: CONTEXT, width: 1 }, hoverinfo: "skip", showlegend: false });
+          meta: name, line: { color: CONTEXT, width: 1 }, hoverinfo: "none", showlegend: false });
       });
       state.highlights.forEach((name, i) => {
         traces.push({ x: days, y: tf(DATA.prices[name]), type: "scatter", mode: "lines", name,
-          line: { color: SERIES[i], width: 2.2 }, hovertemplate: `${name}: %{y:.2f}<extra></extra>` });
+          meta: name, line: { color: SERIES[i], width: 2.2 }, hovertemplate: `${name}: %{y:.2f}<extra></extra>` });
       });
       const layout = baseLayout({
         yaxis: { gridcolor: GRID, zeroline: false, color: AXIS,
@@ -352,6 +369,74 @@
       });
       Plotly.react("priceChart", traces, layout, PLOT_CFG);
       $("pricesSub").textContent = `${ASSETS.length} instruments · ${DATA.nDays} days · ${state.highlights.length} highlighted`;
+      bindPriceClick();
+    }
+
+    // --- click-to-select on the price chart ------------------------------ //
+    // Toggle an instrument's highlight by clicking its line. Bound once, after
+    // the first Plotly.react (gd.on only exists once the div is a plot, and
+    // react preserves handlers across redraws).
+    let priceClickBound = false;
+    function bindPriceClick() {
+      if (priceClickBound) return;
+      const gd = $("priceChart");
+      if (!gd || typeof gd.on !== "function") return;
+      gd.on("plotly_click", onPriceClick);
+      priceClickBound = true;
+    }
+
+    function toggleHighlightName(name) {
+      const i = state.highlights.indexOf(name);
+      if (i >= 0) { state.highlights.splice(i, 1); return true; }
+      if (state.highlights.length >= MAX_HL) return false;
+      state.highlights.push(name);
+      return true;
+    }
+
+    // In "x unified" hovermode a click reports every trace at that x. Pick the
+    // single line whose on-screen y is nearest the cursor, so overlapping lines
+    // resolve to exactly one instrument. Range/size come straight from the
+    // resolved layout, so this is correct for linear, log and rebased y-axes.
+    function closestPoint(gd, points, ev) {
+      if (points.length <= 1) return points[0];
+      const fl = gd._fullLayout, sz = fl && fl._size, ya = fl && fl.yaxis;
+      if (!sz || !ya || !ya.range || ev.clientY == null) return points[0];
+      const mouseY = ev.clientY - gd.getBoundingClientRect().top;   // px from top
+      const r0 = ya.range[0], r1 = ya.range[1], isLog = ya.type === "log";
+      const toPix = (v) => {
+        const lval = isLog ? Math.log10(v) : v;
+        return sz.t + (1 - (lval - r0) / (r1 - r0)) * sz.h;          // 0 top … h bottom
+      };
+      let best = Infinity, chosen = points[0];
+      points.forEach((pt) => {
+        if (pt.y == null || (isLog && pt.y <= 0)) return;
+        const d = Math.abs(toPix(pt.y) - mouseY);
+        if (d < best) { best = d; chosen = pt; }
+      });
+      return chosen;
+    }
+
+    function onPriceClick(data) {
+      if (state.tab !== "prices" || !data || !data.points || !data.points.length) return;
+      const ev = data.event || {};
+      if (!(ev.shiftKey || ev.ctrlKey || ev.metaKey)) return;   // deliberate gesture only
+      const chosen = closestPoint($("priceChart"), data.points, ev);
+      const name = chosen && chosen.data && chosen.data.meta;
+      if (!name) return;
+      if (!toggleHighlightName(name)) { flashHint(`Highlight limit reached (${MAX_HL}) — deselect one first.`); return; }
+      drawPrices();
+      renderRail();   // keep the rail's highlight list in sync
+    }
+
+    // Briefly replace the price hint (e.g. to explain a no-op), then restore it.
+    let hintTimer = null, hintDefault = null;
+    function flashHint(msg) {
+      const h = document.querySelector("#view-prices .hint");
+      if (!h) return;
+      if (hintDefault == null) hintDefault = h.textContent;
+      h.textContent = msg;
+      clearTimeout(hintTimer);
+      hintTimer = setTimeout(() => { h.textContent = hintDefault; hintTimer = null; }, 1800);
     }
 
     // --- Moving averages ------------------------------------------------- //
@@ -377,6 +462,7 @@
     }
 
     function drawMA() {
+      persist();
       const wrap = $("maCharts");
       wrap.innerHTML = "";
       const defs = state.maDefs.filter((d) => d.type && d.period >= 2);
@@ -393,6 +479,11 @@
 
       state.maInstruments.forEach((name) => {
         const p = DATA.prices[name];
+        // Rebasing multiplies by 100/p0. These MAs are all linear, so this commutes
+        // with them and preserves crossover signs — compute in raw price space, then
+        // scale the price line, every MA and (via `series`) the marker y's uniformly.
+        const k = state.maRebase ? 100 / (p[0] || 1) : 1;
+        const rb = (arr) => (k === 1 ? arr : arr.map((v) => (v == null ? null : v * k)));
         const card = el("div", "macard");
         const head = el("div", "mahead");
         head.appendChild(el("span", null, name));
@@ -402,11 +493,11 @@
         card.appendChild(plot); wrap.appendChild(card);
 
         const series = {};  // short label -> computed MA (reused for crossovers)
-        const traces = [{ x: days, y: p, type: "scatter", mode: "lines", name: `${name} price`,
+        const traces = [{ x: days, y: rb(p), type: "scatter", mode: "lines", name: `${name} price`,
           line: { color: "#9aa0a6", width: 1.4 }, hovertemplate: "%{y:.2f}<extra>price</extra>" }];
         defs.forEach((d, i) => {
           const short = shortOf(d);
-          const y = movingAverage(p, d.type, d.period);
+          const y = rb(movingAverage(p, d.type, d.period));
           series[short] = y;
           traces.push({ x: days, y, type: "scatter", mode: "lines",
             name: short, line: { color: SERIES[(i + 1) % SERIES.length], width: 1.8 },
@@ -425,12 +516,14 @@
 
         Plotly.newPlot(plot, traces, baseLayout({ margin: { t: 8, r: 60, b: 34, l: 52 }, showlegend: true,
           legend: { orientation: "h", y: -0.18, font: { size: 10 } },
-          yaxis: { gridcolor: GRID, zeroline: false, color: AXIS, title: { text: "Price", font: { size: 11 } } } }), PLOT_CFG);
+          yaxis: { gridcolor: GRID, zeroline: false, color: AXIS, type: state.maLog ? "log" : "linear",
+            title: { text: state.maRebase ? "Rebased (=100)" : "Price", font: { size: 11 } } } }), PLOT_CFG);
       });
     }
 
     // --- Correlation ----------------------------------------------------- //
     function drawCorr() {
+      persist();
       const cols = state.corrSubset.length ? state.corrSubset : ASSETS;
       const rets = cols.map((a) => logReturns(DATA.prices[a]));
       const z = cols.map((_, i) => cols.map((_, j) => (i === j ? 1 : pearson(rets[i], rets[j]))));
@@ -475,6 +568,7 @@
       return `rgb(${lerp(mid[0], pole[0], k)},${lerp(mid[1], pole[1], k)},${lerp(mid[2], pole[2], k)})`;
     }
     function drawStats() {
+      persist();
       const rows = statsRows();
       const maxAbs = Math.max(...rows.map((r) => Math.abs(r.ann_sharpe))) || 1;
       rows.sort((a, b) => {
@@ -537,10 +631,7 @@
           const sw = el("span", "swatch"); if (on) sw.style.background = on;
           row.append(sw, el("span", null, name), el("span", "num", DATA.last[name].toFixed(2)));
           row.addEventListener("click", () => {
-            const i = state.highlights.indexOf(name);
-            if (i >= 0) state.highlights.splice(i, 1);
-            else { if (state.highlights.length >= MAX_HL) return; state.highlights.push(name); }
-            drawPrices(); renderList();
+            if (toggleHighlightName(name)) { drawPrices(); renderList(); }
           });
           list.appendChild(row);
         });
@@ -636,20 +727,63 @@
     document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => showTab(t.dataset.tab)));
     $("mRebase").addEventListener("click", (e) => { state.rebase = !state.rebase; e.currentTarget.classList.toggle("active", state.rebase); drawPrices(); });
     $("mLog").addEventListener("click", (e) => { state.logY = !state.logY; e.currentTarget.classList.toggle("active", state.logY); drawPrices(); });
+    $("maRebase").addEventListener("click", (e) => { state.maRebase = !state.maRebase; e.currentTarget.classList.toggle("active", state.maRebase); drawMA(); });
+    $("maLog").addEventListener("click", (e) => { state.maLog = !state.maLog; e.currentTarget.classList.toggle("active", state.maLog); drawMA(); });
+
+    // --- session persistence (localStorage, not cookies: no server here) -- //
+    // Saved on every draw — each state-changing interaction ends in one. Only
+    // durable selections are stored; transient search filters are left out.
+    function persist() {
+      try {
+        localStorage.setItem(STORE_KEY, JSON.stringify({
+          v: 1, tab: state.tab, highlights: state.highlights, rebase: state.rebase,
+          logY: state.logY, maRebase: state.maRebase, maLog: state.maLog,
+          maInstruments: state.maInstruments, maDefs: state.maDefs,
+          corrSubset: state.corrSubset, sortKey: state.sortKey, sortDir: state.sortDir,
+        }));
+      } catch (e) { /* storage disabled or full — run without persistence */ }
+    }
+
+    // Restore, validating everything against the *current* dataset: instrument
+    // names, MA types/periods and enum-ish fields can all go stale if prices.txt
+    // changed since the session was saved, so anything unrecognised is dropped.
+    function loadPersist() {
+      let saved;
+      try { saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { saved = null; }
+      if (!saved || typeof saved !== "object") return;
+      const known = new Set(ASSETS);
+      const names = (arr, cap) => Array.isArray(arr) ? arr.filter((n) => known.has(n)).slice(0, cap || arr.length) : null;
+
+      const hl = names(saved.highlights, MAX_HL); if (hl) state.highlights = hl;
+      const mi = names(saved.maInstruments);      if (mi) state.maInstruments = mi;
+      const cs = names(saved.corrSubset);         if (cs) state.corrSubset = cs;
+      if (Array.isArray(saved.maDefs)) {
+        const defs = saved.maDefs
+          .filter((d) => d && MA_TYPES.includes(d.type))
+          .map((d) => ({ type: d.type, period: Math.min(Math.max(2, parseInt(d.period, 10) || 2), DATA.nDays - 1) }));
+        if (defs.length) state.maDefs = defs;
+      }
+      if (typeof saved.rebase === "boolean") state.rebase = saved.rebase;
+      if (typeof saved.logY === "boolean") state.logY = saved.logY;
+      if (typeof saved.maRebase === "boolean") state.maRebase = saved.maRebase;
+      if (typeof saved.maLog === "boolean") state.maLog = saved.maLog;
+      if (TABS.includes(saved.tab)) state.tab = saved.tab;
+      if (COLS.some((c) => c.key === saved.sortKey)) state.sortKey = saved.sortKey;
+      if (saved.sortDir === 1 || saved.sortDir === -1) state.sortDir = saved.sortDir;
+    }
 
     // --- boot ------------------------------------------------------------ //
-    const TABS = ["prices", "ma", "corr", "stats"];
+    loadPersist();
+    $("mRebase").classList.toggle("active", state.rebase);   // reflect restored toggles
+    $("mLog").classList.toggle("active", state.logY);
+    $("maRebase").classList.toggle("active", state.maRebase);
+    $("maLog").classList.toggle("active", state.maLog);
     const initial = (location.hash || "").replace("#", "");
     window.addEventListener("hashchange", () => {
       const t = (location.hash || "").replace("#", "");
       if (TABS.includes(t)) showTab(t);
     });
-    if (TABS.includes(initial)) {
-      showTab(initial);
-    } else {
-      renderRail();
-      drawPrices();
-    }
+    showTab(TABS.includes(initial) ? initial : state.tab);   // hash deep-link wins over saved tab
   })();
   </script>
 </body>
