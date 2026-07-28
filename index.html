@@ -106,7 +106,7 @@
 
     .list { display: flex; flex-direction: column; min-height: 0; overflow: auto; }
     .row {
-      display: grid; grid-template-columns: 14px 1fr auto; gap: 0.5rem;
+      display: grid; grid-template-columns: 14px 2.1em 1fr auto; gap: 0.5rem;
       align-items: center; padding: 0.28rem 0.4rem; border-radius: 5px;
       cursor: pointer; color: var(--muted);
     }
@@ -115,6 +115,8 @@
     .swatch { width: 11px; height: 11px; border-radius: 2px; border: 1px solid #3a4250; background: transparent; }
     .row.on .swatch { border-color: transparent; }
     .num { font-variant-numeric: tabular-nums; color: inherit; opacity: 0.85; }
+    /* prices.txt column index — stays dim even on selected rows so it reads as a gutter */
+    .idx { font-variant-numeric: tabular-nums; text-align: right; color: var(--muted); opacity: 0.7; font-size: 0.74rem; }
 
     /* MA definition editor ------------------------------------------------- */
     .madef { display: grid; grid-template-columns: 1fr 62px 22px; gap: 0.35rem; align-items: center; }
@@ -157,6 +159,7 @@
     .macard { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.6rem; }
     .macard .mahead { font-size: 0.85rem; font-weight: 600; margin: 0.1rem 0 0.2rem 0.2rem; }
     .macard .mahead .maxnote { color: var(--muted); font-weight: 400; font-size: 0.75rem; }
+    .macard .mahead .maidx { color: var(--muted); font-weight: 400; font-size: 0.78rem; margin-right: 0.35rem; }
     .maplot { height: 300px; }
 
     #corrChart {
@@ -168,7 +171,10 @@
     #statsWrap { overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; flex: 1; }
     table.stats { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 0.9rem; }
     table.stats th, table.stats td { padding: 0.42rem 0.7rem; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
-    table.stats th:first-child, table.stats td:first-child { text-align: left; }
+    /* col 1 is the prices.txt index (a right-aligned gutter); col 2 is the ticker */
+    table.stats th:nth-child(2), table.stats td:nth-child(2) { text-align: left; }
+    table.stats th:first-child, table.stats td:first-child { padding-right: 0.3rem; width: 1%; }
+    table.stats td:first-child { color: var(--muted); }
     table.stats th {
       position: sticky; top: 0; background: #201f1d; color: var(--muted);
       font-weight: 600; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em;
@@ -229,7 +235,7 @@
       </section>
 
       <section class="view" id="view-stats">
-        <div class="head"><div><h1>Per-instrument statistics</h1><div class="sub">Click a column header to sort. Sharpe is shaded red → green.</div></div></div>
+        <div class="head"><div><h1>Per-instrument statistics</h1><div class="sub"># is the instrument's index in prices.txt (ALGO = 0). Click a column header to sort. Sharpe is shaded red → green.</div></div></div>
         <div id="statsWrap"></div>
       </section>
     </main>
@@ -272,6 +278,11 @@
       maFilter: "",
       corrFilter: "",
     };
+
+    // Position in prices.txt (column order), ALGO = 0. ASSETS comes straight from
+    // that file's header row, so the array index *is* the instrument's index.
+    const INDEX_OF = new Map(ASSETS.map((name, i) => [name, i]));
+    const idxOf = (name) => INDEX_OF.get(name);
 
     const $ = (id) => document.getElementById(id);
     const el = (tag, cls, txt) => { const n = document.createElement(tag); if (cls) n.className = cls; if (txt != null) n.textContent = txt; return n; };
@@ -486,6 +497,7 @@
         const rb = (arr) => (k === 1 ? arr : arr.map((v) => (v == null ? null : v * k)));
         const card = el("div", "macard");
         const head = el("div", "mahead");
+        head.appendChild(el("span", "maidx", `#${idxOf(name)}`));
         head.appendChild(el("span", null, name));
         if (fastDef) head.appendChild(el("span", "maxnote", `   ▲▼ crosses: ${shortOf(fastDef)} vs ${shortOf(slowDef)}`));
         card.appendChild(head);
@@ -546,13 +558,14 @@
 
     // --- Stats ----------------------------------------------------------- //
     function statsRows() {
-      return ASSETS.map((name) => {
+      return ASSETS.map((name, i) => {
         const p = DATA.prices[name], r = logReturns(p), mu = mean(r), sd = std(r);
-        return { name, last_price: p[p.length - 1], mean_daily_return: mu, volatility: sd,
+        return { index: i, name, last_price: p[p.length - 1], mean_daily_return: mu, volatility: sd,
           ann_sharpe: sd > 0 ? (Math.sqrt(250) * mu) / sd : 0 };
       });
     }
     const COLS = [
+      { key: "index", label: "#", fmt: (v) => String(v) },
       { key: "name", label: "Instrument", fmt: (v) => v },
       { key: "last_price", label: "Last price", fmt: (v) => v.toFixed(2) },
       { key: "mean_daily_return", label: "Mean ret", fmt: (v) => v.toFixed(5) },
@@ -601,6 +614,14 @@
       else railStats(rail);
     }
 
+    // Instrument search: an all-digits query filters on the prices.txt index
+    // (prefix match, so "1" keeps 1 and 10–19), anything else on the ticker.
+    function matchesFilter(name, q) {
+      if (!q) return true;
+      if (/^\d+$/.test(q)) return String(idxOf(name)).startsWith(q);
+      return name.includes(q);
+    }
+
     function filterInput(value, placeholder, onInput) {
       const inp = el("input"); inp.type = "search"; inp.placeholder = placeholder;
       inp.value = value; inp.autocomplete = "off";
@@ -613,7 +634,7 @@
     // thus never blurs) the input element.
     function railPrices(rail) {
       rail.appendChild(el("h2", null, "Highlight"));
-      rail.appendChild(filterInput(state.priceFilter, "Filter instruments…", (v) => { state.priceFilter = v; renderList(); }));
+      rail.appendChild(filterInput(state.priceFilter, "Filter by ticker or index…", (v) => { state.priceFilter = v; renderList(); }));
       const meta = el("div", "meta");
       const count = el("span", null, "");
       const clear = el("button", "linkbtn", "clear");
@@ -625,11 +646,12 @@
         list.innerHTML = "";
         const q = state.priceFilter.trim().toUpperCase();
         ASSETS.forEach((name) => {
-          if (q && !name.includes(q)) return;
+          if (!matchesFilter(name, q)) return;
           const on = colorFor(name);
           const row = el("div", "row" + (on ? " on" : ""));
           const sw = el("span", "swatch"); if (on) sw.style.background = on;
-          row.append(sw, el("span", null, name), el("span", "num", DATA.last[name].toFixed(2)));
+          row.append(sw, el("span", "idx", String(idxOf(name))), el("span", null, name),
+            el("span", "num", DATA.last[name].toFixed(2)));
           row.addEventListener("click", () => {
             if (toggleHighlightName(name)) { drawPrices(); renderList(); }
           });
@@ -648,11 +670,11 @@
         list.innerHTML = "";
         const q = getFilter().trim().toUpperCase();
         ASSETS.forEach((name) => {
-          if (q && !name.includes(q)) return;
+          if (!matchesFilter(name, q)) return;
           const on = getSelected().includes(name);
           const row = el("div", "row" + (on ? " on" : ""));
           const box = el("span", "swatch"); if (on) { box.style.background = "var(--accent)"; box.style.borderColor = "transparent"; }
-          row.append(box, el("span", null, name));
+          row.append(box, el("span", "idx", String(idxOf(name))), el("span", null, name));
           row.addEventListener("click", () => { onToggle(name); renderList(); });
           list.appendChild(row);
         });
@@ -664,7 +686,7 @@
     function railMA(rail) {
       rail.appendChild(el("h2", null, "Instruments"));
       let renderList;
-      rail.appendChild(filterInput(state.maFilter, "Filter…", (v) => { state.maFilter = v; renderList(); }));
+      rail.appendChild(filterInput(state.maFilter, "Ticker or index…", (v) => { state.maFilter = v; renderList(); }));
       renderList = checkList(rail, () => state.maInstruments, () => state.maFilter, (name) => {
         const i = state.maInstruments.indexOf(name);
         if (i >= 0) state.maInstruments.splice(i, 1); else state.maInstruments.push(name);
@@ -690,7 +712,7 @@
     function railCorr(rail) {
       rail.appendChild(el("h2", null, "Subset (empty = all)"));
       let renderList;
-      rail.appendChild(filterInput(state.corrFilter, "Filter…", (v) => { state.corrFilter = v; renderList(); }));
+      rail.appendChild(filterInput(state.corrFilter, "Ticker or index…", (v) => { state.corrFilter = v; renderList(); }));
       const meta = el("div", "meta");
       const count = el("span", null, "");
       const clear = el("button", "linkbtn", "clear");
@@ -708,7 +730,7 @@
     function railStats(rail) {
       rail.appendChild(el("h2", null, "Stats"));
       const note = el("div", "meta"); note.style.display = "block"; note.style.lineHeight = "1.5";
-      note.innerHTML = "All " + ASSETS.length + " instruments. Click any column header to sort ascending/descending. The Sharpe column is shaded from red (negative) through grey to green (positive).";
+      note.innerHTML = "All " + ASSETS.length + " instruments. The # column is the instrument's index in prices.txt (ALGO = 0). Click any column header to sort ascending/descending. The Sharpe column is shaded from red (negative) through grey to green (positive).";
       rail.appendChild(note);
     }
 
